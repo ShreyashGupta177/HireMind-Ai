@@ -1,0 +1,442 @@
+﻿require("dotenv").config();
+
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+const multer = require("multer");
+const fs = require("fs");
+const fsExtra = require("fs-extra");
+const pdfParse = require("pdf-parse");
+const mammoth = require("mammoth");
+const path = require("path");
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+const ML_SERVICE_URL = process.env.ML_SERVICE_URL || "http://localhost:8000";
+const ML_TIMEOUT = parseInt(process.env.ML_TIMEOUT) || 60000;
+
+const uploadsDir = path.join(__dirname, "uploads");
+fsExtra.ensureDirSync(uploadsDir);
+
+// CORS Configuration
+app.use(cors({
+    origin: true,
+    credentials: true
+}));
+app.use(express.json({ limit: "10mb" }));
+
+// File upload config
+const upload = multer({
+    dest: uploadsDir,
+    limits: { fileSize: 2 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        const allowedTypes = ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"];
+        if (allowedTypes.includes(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error("Only PDF or DOCX files allowed (max 2MB)"));
+        }
+    }
+});
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// Helper Functions
+function cleanText(text) {
+    if (!text || text.trim().length === 0) {
+        throw new Error("Empty or unreadable file content");
+    }
+    return text.replace(/\n/g, " ").replace(/[^\x00-\x7F]/g, "").replace(/\s+/g, " ").trim().substring(0, 10000);
+}
+
+async function extractText(filePath, mimeType) {
+    let text = "";
+    try {
+        if (mimeType === "application/pdf") {
+            const dataBuffer = fs.readFileSync(filePath);
+            const data = await pdfParse(dataBuffer);
+            text = data.text;
+        } else if (mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
+            const result = await mammoth.extractRawText({ path: filePath });
+            text = result.value;
+        } else {
+            throw new Error("Unsupported file type");
+        }
+        return cleanText(text);
+    } catch (error) {
+        throw new Error(`Text extraction failed: ${error.message}`);
+    }
+}
+
+async function deleteTempFile(filePath) {
+    try {
+        if (filePath && fs.existsSync(filePath)) {
+            await fsExtra.remove(filePath);
+        }
+    } catch (error) {
+        console.error("Failed to delete temp file:", error);
+    }
+}
+
+async function callAIModel(prompt, retries = 2) {
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    for (let i = 0; i < retries; i++) {
+        try {
+            const result = await model.generateContent(prompt);
+            const response = await result.response;
+            const text = response.text();
+            try {
+                return JSON.parse(text);
+            } catch {
+                return { raw: text };
+            }
+        } catch (error) {
+            console.error(`AI call attempt ${i + 1} failed:`, error.message);
+            if (i === retries - 1) throw error;
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+    }
+}
+
+const successResponse = (data) => ({
+    success: true,
+    data,
+    error: null,
+    timestamp: new Date().toISOString()
+});
+
+const errorResponse = (message, statusCode = 400) => ({
+    success: false,
+    data: null,
+    error: message,
+    statusCode,
+    timestamp: new Date().toISOString()
+});
+
+// Health Check
+app.get("/", (req, res) => {
+    res.json(successResponse({
+        message: "Job Portal Backend Running Successfully",
+        status: "active",
+        timestamp: new Date().toISOString()
+    }));
+});
+
+app.get("/api/ml/health", async (req, res) => {
+    try {
+        const response = await axios.get(`${ML_SERVICE_URL}/health`, { timeout: 5000 });
+        res.json(successResponse({ ml_service: "connected", status: response.data }));
+    } catch (error) {
+        res.status(503).json(errorResponse("ML service not available on port 8000", 503));
+    }
+});
+
+// Jobs Data
+const jobs = [
+    { id: 1, title: "Frontend Developer", skills: ["React", "JavaScript", "HTML", "CSS", "Tailwind"] },
+    { id: 2, title: "Backend Developer", skills: ["Node.js", "Express", "MongoDB", "API", "Python"] },
+    { id: 3, title: "Full Stack Developer", skills: ["React", "Node.js", "MongoDB", "Express", "JavaScript"] },
+    { id: 4, title: "UI/UX Designer", skills: ["Figma", "Adobe XD", "Sketch", "Prototyping", "User Research"] },
+    { id: 5, title: "DevOps Engineer", skills: ["Docker", "Kubernetes", "AWS", "CI/CD", "Linux"] },
+    { id: 6, title: "Data Scientist", skills: ["Python", "Machine Learning", "SQL", "TensorFlow", "Statistics"] },
+    { id: 7, title: "Mobile Developer", skills: ["React Native", "Flutter", "iOS", "Android", "Firebase"] },
+    { id: 8, title: "QA Engineer", skills: ["Selenium", "Jest", "Cypress", "Manual Testing", "Automation"] }
+];
+
+app.get("/api/jobs", (req, res) => {
+    res.json(successResponse(jobs));
+});
+
+app.get("/api/jobs/:id", (req, res) => {
+    const job = jobs.find(j => j.id === parseInt(req.params.id));
+    if (!job) return res.status(404).json(errorResponse("Job not found"));
+    res.json(successResponse(job));
+});
+
+// Skills Match
+app.post("/api/match", (req, res) => {
+    try {
+        const { resumeSkills, jobSkills } = req.body;
+        if (!resumeSkills || !Array.isArray(resumeSkills) || !jobSkills || !Array.isArray(jobSkills)) {
+            return res.status(400).json(errorResponse("Both resumeSkills and jobSkills arrays are required"));
+        }
+        const normalizedResumeSkills = resumeSkills.map(s => s.toLowerCase().trim());
+        const normalizedJobSkills = jobSkills.map(s => s.toLowerCase().trim());
+        const matchedSkills = normalizedResumeSkills.filter(skill => normalizedJobSkills.includes(skill));
+        const score = (matchedSkills.length / normalizedJobSkills.length) * 100;
+        const roundedScore = Math.round(score);
+        let message = roundedScore >= 80 ? "Excellent Match!" : roundedScore >= 60 ? "Good Match" : roundedScore >= 40 ? "Partial Match" : "Low Match";
+        res.json(successResponse({ matchScore: roundedScore, matchedSkills, missingSkills: normalizedJobSkills.filter(s => !normalizedResumeSkills.includes(s)), message }));
+    } catch (err) {
+        res.status(500).json(errorResponse("Match calculation failed"));
+    }
+});
+
+// AI Analysis (Gemini)
+app.post("/api/analyze", async (req, res) => {
+    try {
+        const { resume, job } = req.body;
+        if (!resume || resume.length < 10) {
+            return res.status(400).json(errorResponse("Valid resume text required"));
+        }
+        if (!job || job.length < 10) {
+            return res.status(400).json(errorResponse("Valid job description required"));
+        }
+        const prompt = `Analyze this resume against the job description. Resume: ${resume.substring(0, 3000)} Job: ${job.substring(0, 3000)} Return JSON: { "overall_score": 75, "missing_skills": [], "strengths": [], "verdict": "", "cover_letter": "" }`;
+        const result = await callAIModel(prompt);
+        res.json(successResponse(result));
+    } catch (err) {
+        res.status(500).json(errorResponse("AI analysis failed: " + err.message));
+    }
+});
+
+// ML Integration
+app.post("/api/ml/analyze", async (req, res) => {
+    try {
+        const { resume_text, jd_text } = req.body;
+        if (!resume_text || resume_text.length < 50) {
+            return res.status(400).json(errorResponse("Valid resume_text required (minimum 50 characters)"));
+        }
+        if (!jd_text || jd_text.length < 50) {
+            return res.status(400).json(errorResponse("Valid jd_text required (minimum 50 characters)"));
+        }
+        const mlResponse = await axios.post(`${ML_SERVICE_URL}/analyze`, { resume_text, jd_text }, { timeout: ML_TIMEOUT });
+        res.json(successResponse(mlResponse.data));
+    } catch (error) {
+        if (error.code === "ECONNREFUSED") {
+            return res.status(503).json(errorResponse("ML service is not running on port 8000", 503));
+        }
+        res.status(500).json(errorResponse("ML analysis failed: " + error.message));
+    }
+});
+
+// Application Tracker
+let applications = [];
+const APPS_FILE = path.join(__dirname, "applications.json");
+
+try {
+    if (fs.existsSync(APPS_FILE)) {
+        const data = fs.readFileSync(APPS_FILE, "utf8");
+        applications = JSON.parse(data);
+        console.log(`Loaded ${applications.length} saved applications`);
+    }
+} catch (error) {
+    console.error("Failed to load applications:", error);
+}
+
+function saveApplications() {
+    try {
+        fs.writeFileSync(APPS_FILE, JSON.stringify(applications, null, 2));
+    } catch (error) {
+        console.error("Failed to save applications:", error);
+    }
+}
+
+app.post("/api/apply", (req, res) => {
+    try {
+        const { company, role, notes } = req.body;
+        if (!company || !role) {
+            return res.status(400).json(errorResponse("Company and role required"));
+        }
+        const newApp = { id: Date.now(), company, role, status: "Applied", date: new Date().toISOString(), notes: notes || "", updatedAt: new Date().toISOString() };
+        applications.unshift(newApp);
+        saveApplications();
+        res.json(successResponse(newApp));
+    } catch (err) {
+        res.status(500).json(errorResponse("Failed to submit application"));
+    }
+});
+
+app.get("/api/applications", (req, res) => {
+    res.json(successResponse({ total: applications.length, applications }));
+});
+
+app.put("/api/applications/:id", (req, res) => {
+    try {
+        const { status } = req.body;
+        const appIndex = applications.findIndex(a => a.id === parseInt(req.params.id));
+        if (appIndex === -1) return res.status(404).json(errorResponse("Application not found"));
+        applications[appIndex].status = status;
+        applications[appIndex].updatedAt = new Date().toISOString();
+        saveApplications();
+        res.json(successResponse(applications[appIndex]));
+    } catch (err) {
+        res.status(500).json(errorResponse("Failed to update application"));
+    }
+});
+
+app.delete("/api/applications/:id", (req, res) => {
+    const appIndex = applications.findIndex(a => a.id === parseInt(req.params.id));
+    if (appIndex === -1) return res.status(404).json(errorResponse("Application not found"));
+    const deleted = applications.splice(appIndex, 1)[0];
+    saveApplications();
+    res.json(successResponse({ message: "Application deleted", deleted }));
+});
+
+// File Upload
+app.post("/api/upload", upload.single("file"), async (req, res) => {
+    const filePath = req.file?.path;
+    try {
+        if (!req.file) return res.status(400).json(errorResponse("No file uploaded"));
+        const extractedText = await extractText(filePath, req.file.mimetype);
+        res.json(successResponse({ extractedText, preview: extractedText.substring(0, 500) }));
+    } catch (err) {
+        res.status(500).json(errorResponse(err.message));
+    } finally {
+        if (filePath) await deleteTempFile(filePath);
+    }
+});
+
+// ==================== SCRAPING ENDPOINTS ====================
+
+// Store scraped jobs in memory
+let scrapedJobs = [];
+const SCRAPED_FILE = path.join(__dirname, "scraped_jobs.json");
+
+// Load saved scraped jobs on startup
+try {
+    if (fs.existsSync(SCRAPED_FILE)) {
+        const data = fs.readFileSync(SCRAPED_FILE, "utf8");
+        scrapedJobs = JSON.parse(data);
+        console.log(`📋 Loaded ${scrapedJobs.length} scraped jobs`);
+    }
+} catch (error) {
+    console.error("Failed to load scraped jobs:", error);
+}
+
+// Save scraped jobs to file
+function saveScrapedJobs() {
+    try {
+        fs.writeFileSync(SCRAPED_FILE, JSON.stringify(scrapedJobs, null, 2));
+    } catch (error) {
+        console.error("Failed to save scraped jobs:", error);
+    }
+}
+
+// Receive scraped jobs from Python scraper
+app.post("/api/scrape/results", (req, res) => {
+    try {
+        const { platform, jobs, scraped_at } = req.body;
+        
+        if (!platform || !jobs || !Array.isArray(jobs)) {
+            return res.status(400).json(errorResponse("Platform and jobs array required"));
+        }
+        
+        console.log(`\n📥 Received ${jobs.length} jobs from ${platform}`);
+        
+        const jobsWithMeta = jobs.map(job => ({
+            ...job,
+            platform: platform,
+            scraped_at: scraped_at || new Date().toISOString(),
+            received_at: new Date().toISOString()
+        }));
+        
+        scrapedJobs.push(...jobsWithMeta);
+        saveScrapedJobs();
+        
+        console.log(`💾 Total scraped jobs: ${scrapedJobs.length}`);
+        
+        res.json(successResponse({
+            message: `Successfully stored ${jobs.length} jobs from ${platform}`,
+            total_jobs: scrapedJobs.length
+        }));
+        
+    } catch (error) {
+        console.error("Error storing scraped jobs:", error);
+        res.status(500).json(errorResponse("Failed to store scraped jobs"));
+    }
+});
+
+// Get all scraped jobs
+app.get("/api/scrape/jobs", (req, res) => {
+    try {
+        const { platform, limit = 100 } = req.query;
+        
+        let filteredJobs = scrapedJobs;
+        
+        if (platform) {
+            filteredJobs = scrapedJobs.filter(job => job.platform === platform);
+        }
+        
+        const uniqueJobs = [];
+        const seen = new Set();
+        for (const job of filteredJobs) {
+            const key = `${job.title}-${job.company}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                uniqueJobs.push(job);
+            }
+        }
+        
+        res.json(successResponse({
+            total: uniqueJobs.length,
+            jobs: uniqueJobs.slice(0, parseInt(limit)),
+            platforms: [...new Set(scrapedJobs.map(j => j.platform))]
+        }));
+        
+    } catch (error) {
+        console.error("Error fetching scraped jobs:", error);
+        res.status(500).json(errorResponse("Failed to fetch scraped jobs"));
+    }
+});
+
+// Get statistics about scraped jobs
+app.get("/api/scrape/stats", (req, res) => {
+    try {
+        const platformStats = {};
+        for (const job of scrapedJobs) {
+            platformStats[job.platform] = (platformStats[job.platform] || 0) + 1;
+        }
+        
+        res.json(successResponse({
+            total_jobs: scrapedJobs.length,
+            by_platform: platformStats,
+            last_scraped: scrapedJobs.length > 0 ? scrapedJobs[scrapedJobs.length - 1].received_at : null
+        }));
+        
+    } catch (error) {
+        res.status(500).json(errorResponse("Failed to get statistics"));
+    }
+});
+
+// Clear all scraped jobs (for testing)
+app.delete("/api/scrape/clear", (req, res) => {
+    try {
+        scrapedJobs = [];
+        saveScrapedJobs();
+        res.json(successResponse({ message: "All scraped jobs cleared" }));
+    } catch (error) {
+        res.status(500).json(errorResponse("Failed to clear jobs"));
+    }
+});
+
+// ==================== ERROR HANDLERS ====================
+
+// Error Handler
+app.use((err, req, res, next) => {
+    console.error("Error:", err.message);
+    if (err instanceof multer.MulterError) {
+        return res.status(400).json(errorResponse("Upload error: " + err.message));
+    }
+    res.status(500).json(errorResponse(err.message || "Internal server error"));
+});
+
+// 404 Handler - MUST BE LAST BEFORE SERVER START
+app.use((req, res) => {
+    res.status(404).json(errorResponse("Route not found: " + req.method + " " + req.url));
+});
+
+// ==================== START SERVER ====================
+app.listen(PORT, () => {
+    console.log("");
+    console.log("========================================");
+    console.log("🚀 Server is running!");
+    console.log("📡 URL: http://localhost:" + PORT);
+    console.log("🔑 API Key: " + (process.env.GEMINI_API_KEY ? "✅ Loaded" : "❌ Missing"));
+    console.log("📁 Uploads: " + uploadsDir);
+    console.log("========================================");
+    console.log("");
+});
+
+module.exports = app;

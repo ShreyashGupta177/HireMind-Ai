@@ -1,0 +1,22 @@
+@import './styles/animations.css';
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-deep-black text-white antialiased;
+  }
+  ::selection {
+    @apply bg-primary-purple/30 text-white;
+  }
+}
+
+@layer components {
+  .gradient-text {
+    @apply bg-gradient-to-r from-primary-purple to-accent-fuchsia bg-clip-text text-transparent;
+  }
+  .glass-card {
+    @apply bg-dark-purple/40 backdrop-blur-md border border-white/5 rounded-2xl;
+  }
+}
